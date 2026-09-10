@@ -1,13 +1,25 @@
 //========================================================================
-//  XIAO ESP32-S3 Sense - On-Device Vision Trainer
+//  XIAO ESP32-S3 Sense - On-Device Vision Trainer v2.0
 //  ---------------------------------------------------------------
-//  - Captures 64x64 RGB images from the onboard camera
-//  - Stores BMP images in sensibly named SD folders under /vision
-//  - Trains a fully-connected neural net (MLP) ON DEVICE:
-//      12,288 (64x64x3) -> 64 ReLU -> 3 (softmax)
-//    float32 SGD + cross-entropy, no cloud / no PC training
-//  - Model binary saved to SD: /vision/models/model_XXXX.bin
-//  - Serial menu system @ 115200 baud
+//  v2 adds:
+//   - SSD1306 72x40 OLED (U8g2lib, HW I2C: SDA=GPIO5/D4, SCL=GPIO6/D5)
+//       * scrollable menu with highlighted active item (5 visible lines)
+//       * live black/white camera view while capturing / inferring
+//       * training progress page (epoch/loss/acc/ETA + progress bar)
+//       * inference OLED refresh throttled to every 10th frame
+//   - Capacitive touch navigation (touchRead):
+//       D0 (GPIO1/T1) = ACTIVATE / ENTER item
+//       D1 (GPIO2/T2) = SCROLL UP
+//       D2 (GPIO3/T3) = SCROLL DOWN
+//       D3 (GPIO4/T4) = EXIT / BACK
+//     NOTE: pins D6 (GPIO43 UART TX) and D7 (GPIO44 UART RX) have NO
+//     touch channel; D8 (GPIO7) is the SD card SCK and is in use.
+//     That is why navigation lives on D0-D3.
+//   - Capture menu entries auto-shoot 10 training images per class:
+//       CAP0 x10 / CAP1 x10 / CAP2 x10 -> /vision/train/class_{0,1,2}
+//
+//  Model: 12288 (64x64x3) -> 64 ReLU -> 3 softmax, float32 SGD.
+//  Serial menu @115200 still fully functional in parallel.
 //
 //  Build FQBN (PSRAM is REQUIRED):
 //      esp32:esp32:XIAO_ESP32S3:PSRAM=opi
@@ -17,6 +29,8 @@
 #include <SD.h>
 #include <FS.h>
 #include <SPI.h>
+#include <Wire.h>
+#include <U8g2lib.h>
 #include <math.h>
 
 // ---------------- XIAO ESP32-S3 Sense camera pins (B2B connector) ------
@@ -37,10 +51,23 @@
 #define HREF_GPIO_NUM  47
 #define PCLK_GPIO_NUM  13
 
-#define SD_CS_PIN       21          // Sense SD slot chip select (same pin as user LED)
-#define LED_BUILTIN_NEG 21          // active LOW
+#define SD_CS_PIN       21          // Sense SD slot CS (shared with user LED, active LOW)
 
-// ---------------- Model shape ----------------------------------------
+// ---------------- OLED + touch -----------------------------------------
+// 72x40 SSD1306 on the default Wire pins (SDA=GPIO5/D4, SCL=GPIO6/D5).
+U8G2_SSD1306_72X40_ER_1_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE);
+
+#define TOUCH_ENTER   1   // D0 = GPIO1, TOUCH1  : activate / enter
+#define TOUCH_UP      2   // D1 = GPIO2, TOUCH2  : scroll up
+#define TOUCH_DOWN    3   // D2 = GPIO3, TOUCH3  : scroll down
+#define TOUCH_BACK    4   // D3 = GPIO4, TOUCH4  : exit / back
+#define TOUCH_PINS    4
+static const int g_touchPin[TOUCH_PINS] = { TOUCH_ENTER, TOUCH_UP, TOUCH_DOWN, TOUCH_BACK };
+static int  g_touchThr[TOUCH_PINS];
+static bool g_touchPrev[TOUCH_PINS] = {false, false, false, false};
+static uint32_t g_touchLockUntil = 0;
+
+// ---------------- model / dataset shape ---------------------------------
 #define IMG_W      64
 #define IMG_H      64
 #define IMG_CH     3
@@ -48,13 +75,13 @@
 #define HIDDEN_N   64
 #define OUT_N      3
 #define MAX_PER_CL 48
-#define MAX_DATASET (MAX_PER_CL * OUT_N)      // 144 images x 12288 bytes
+#define MAX_DATASET (MAX_PER_CL * OUT_N)      // 144 images x 12288 B
 
-// ---------------- Globals ----------------------------------------------
-static float *W1 = NULL;   // [HIDDEN][INPUT]  in PSRAM (~3.0 MB float32)
-static float *b1 = NULL;   // [HIDDEN]
-static float *W2 = NULL;   // [OUT][HIDDEN]
-static float *b2 = NULL;   // [OUT]
+// ---------------- globals -------------------------------------------------
+static float *W1 = NULL;
+static float *b1 = NULL;
+static float *W2 = NULL;
+static float *b2 = NULL;
 static bool   g_weightInit = false;
 static uint32_t g_totalEpochs = 0;
 static float  g_lastLoss = 0.0f;
@@ -62,7 +89,7 @@ static float  g_lastLoss = 0.0f;
 static uint16_t g_epochs = 30;
 static float    g_lr = 0.05f;
 
-static uint8_t *g_trainData = NULL;   // raw 64x64x3 pixels, PSRAM
+static uint8_t *g_trainData = NULL;
 static uint8_t  g_trainLabels[MAX_DATASET];
 static int      g_trainCount = 0;
 
@@ -71,16 +98,47 @@ static bool g_sdOk = false;
 static bool g_camOk = false;
 static bool g_psramOk = false;
 
-// Scratch (internal SRAM is fine at these sizes)
-static float  g_xnorm[INPUT_N];       // 49 KB
+static float  g_xnorm[INPUT_N];
 static float  g_hval[HIDDEN_N];
 static float  g_y[OUT_N];
 static float  g_dh[HIDDEN_N];
-static uint8_t g_curImg[INPUT_N];     // 12 KB latest captured image
+static uint8_t g_curImg[INPUT_N];       // latest 64x64x3 frame
+
+// training progress shared with the OLED page
+static volatile int   g_prEpoch = 0, g_prEpochs = 0;
+static volatile float g_prLoss = 0.0f, g_prAcc = 0.0f;
+static volatile uint32_t g_prEtaS = 0;
+static volatile bool  g_prActive = false;
 
 static uint32_t s_rng = 0x9E3779B9u;
 
-// ---------------- helpers ----------------------------------------------
+// ---------------- OLED state -------------------------------------------------
+enum OledMode { OLM_MENU, OLM_CAMERA, OLM_TRAIN, OLM_INFO };
+typedef struct {
+  const char *label;      // <=13 chars, fits 14-col 5x8 font at 72px minus margin
+  void (*action)(void);
+} MenuItem;
+
+static OledMode g_oledMode = OLM_MENU;
+static bool    g_oledDirty = true;
+static int     g_menuCur = 0;
+static int     g_menuTop = 0;
+static int     g_menuCount = 0;
+static const MenuItem *g_menuItems = NULL;
+
+// static info page lines (4 visible lines on 40px @5x8)
+static char g_infoLines[5][14];
+
+// line(s) shown above the live B/W image during inference
+static char  g_camInfo[14];
+static int   g_camFps = 0;
+
+// camera-sub-mode: what the OLED is currently showing while in OLM_CAMERA
+enum CamShow { CSH_NONE, CSH_PREVIEW, CSH_INFER, CSH_CAPTURE };
+static CamShow g_camShow = CSH_NONE;
+static int    g_capProg = 0, g_capTotal = 0, g_capCls = -1;
+
+// ---------------- helpers -----------------------------------------------------
 static void putU16(uint8_t *b, uint16_t v) { b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); }
 static void putU32(uint8_t *b, uint32_t v) { b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); b[2] = (uint8_t)(v >> 16); b[3] = (uint8_t)(v >> 24); }
 
@@ -100,7 +158,48 @@ static float frand(float lo, float hi) {
   return lo + ((float)(s_rng & 0xFFFF) / 65535.0f) * (hi - lo);
 }
 
-static void setLed(bool on) { digitalWrite(LED_BUILTIN_NEG, on ? LOW : HIGH); }
+static void setLed(bool on) { digitalWrite(LED_BUILTIN, on ? LOW : HIGH); }
+
+static bool nnReady() { return W1 && b1 && W2 && b2; }
+
+// mark OLED for the next poll tick
+static inline void oledTouchRequest() { g_oledDirty = true; }
+
+// ---------------- touch ----------------------------------------------------
+static void touchCalibrate() {
+  for (int i = 0; i < TOUCH_PINS; i++) {
+    int best = touchRead(g_touchPin[i]);
+    uint32_t t0 = millis();
+    while (millis() - t0 < 250) {
+      int v = touchRead(g_touchPin[i]);
+      if (v < best) best = v;
+      delay(2);
+    }
+    g_touchThr[i] = (int)(best * 0.62f) + 5;   // finger press drops raw value well below
+    g_touchPrev[i] = false;
+    Serial.printf("  touch D%d (GPIO%d): baseline=%d thr=%d\n",
+                  i == 0 ? 0 : (i == 1 ? 1 : (i == 2 ? 2 : 3)),
+                  g_touchPin[i], best, g_touchThr[i]);
+  }
+}
+
+// Returns a mask of freshly-pressed keys (debounced, non-blocking, rate-limited).
+static uint8_t pollTouchKeys() {
+  if ((int32_t)(millis() - g_touchLockUntil) < 0) return 0;
+  uint8_t mask = 0;
+  for (int i = 0; i < TOUCH_PINS; i++) {
+    bool pressed = touchRead(g_touchPin[i]) < g_touchThr[i];
+    if (pressed && !g_touchPrev[i]) {
+      mask |= (uint8_t)(1u << i);
+      g_touchLockUntil = millis() + 220;   // debounce: ignore retriggers for 220ms
+    }
+    g_touchPrev[i] = pressed;
+  }
+  if (mask) oledTouchRequest();
+  return mask;
+}
+
+static inline bool keyPressed(uint8_t mask, int idx) { return (mask & (1u << idx)) != 0; }
 
 // ---------------- camera ------------------------------------------------
 static bool initCamera() {
@@ -124,11 +223,11 @@ static bool initCamera() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_QVGA;      // 320x240 RGB565, then box->64x64
+  config.frame_size = FRAMESIZE_QVGA;
   config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;                // mandatory field, unused for RGB565
+  config.jpeg_quality = 12;
   config.fb_count = 1;
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -144,12 +243,17 @@ static bool initCamera() {
   return true;
 }
 
-// Area-average downsample of the camera frame to 64x64 RGB888.
-static bool captureRGB888(uint8_t *out) {
+static float pixGray(const uint8_t *img, size_t k) {
+  return (3.0f * img[k] + 6.0f * img[k + 1] + 1.0f * img[k + 2]) / 10.0f;
+}
+
+// Area-average downsample of the camera frame to 64x64 RGB888 (stored in g_curImg).
+static bool captureRGB888() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return false;
   const int sx = (int)fb->width, sy = (int)fb->height;
   const uint16_t *src = (const uint16_t *)fb->buf;
+  uint8_t *out = g_curImg;
   for (int oy = 0; oy < IMG_H; oy++) {
     int y0 = (oy * sy) / IMG_H, y1 = ((oy + 1) * sy) / IMG_H;
     if (y1 <= y0) y1 = y0 + 1;
@@ -186,17 +290,17 @@ static void previewASCII(const uint8_t *img) {
       for (int dy = 0; dy < 4; dy++)
         for (int dx = 0; dx < 4; dx++) {
           size_t k = ((size_t)(oy * 4 + dy) * IMG_W + (ox * 4 + dx)) * 3;
-          g += (3 * img[k] + 6 * img[k + 1] + img[k + 2]) / 10;
+          g += (uint32_t)pixGray(img, k);
           n++;
         }
-      int idx = (int)((uint32_t)(g / n) * 9 / 255);
+      int idx = (int)(((uint32_t)(g / n) * 9) / 255);
       Serial.print(ramp[idx]);
     }
     Serial.println();
   }
 }
 
-// ---------------- BMP 64x64x24 IO ---------------------------------------
+// ---------------- BMP 64x64x24 IO -----------------------------------------
 static bool writeBmp64(const char *path, const uint8_t *rgb) {
   uint8_t hdr[54] = {0};
   const uint32_t raw = IMG_W * IMG_H * 3;
@@ -209,14 +313,15 @@ static bool writeBmp64(const char *path, const uint8_t *rgb) {
   putU32(hdr + 34, raw);
   File f = SD.open(path, FILE_WRITE);
   if (!f) return false;
+  setLed(false);                      // release SD CS line we share with the LED
   f.write(hdr, 54);
   uint8_t line[IMG_W * 3];
-  for (int y = IMG_H - 1; y >= 0; y--) {            // BMP rows are bottom-up
+  for (int y = IMG_H - 1; y >= 0; y--) {
     const uint8_t *row = rgb + (size_t)y * IMG_W * 3;
     for (int x = 0; x < IMG_W; x++) {
-      line[x * 3 + 0] = row[x * 3 + 2];             // B
-      line[x * 3 + 1] = row[x * 3 + 1];             // G
-      line[x * 3 + 2] = row[x * 3 + 0];             // R
+      line[x * 3 + 0] = row[x * 3 + 2];
+      line[x * 3 + 1] = row[x * 3 + 1];
+      line[x * 3 + 2] = row[x * 3 + 0];
     }
     f.write(line, sizeof(line));
   }
@@ -247,7 +352,7 @@ static bool readBmp64(const char *path, uint8_t *rgb) {
   return true;
 }
 
-// ---------------- SD layout ---------------------------------------------
+// ---------------- SD layout ----------------------------------------------
 static void ensureTree() {
   SD.mkdir("/vision");
   SD.mkdir("/vision/train");
@@ -258,7 +363,6 @@ static void ensureTree() {
     trainDirPath(p, sizeof(p), c); SD.mkdir(p);
     testDirPath(p, sizeof(p), c);  SD.mkdir(p);
   }
-  // legacy migration: pre-v2 folder name -> v2 name
   for (int c = 0; c < OUT_N; c++) {
     char from[64], to[64];
     snprintf(from, sizeof(from), "/vision/class%d", c);
@@ -332,7 +436,7 @@ static void listTree(const char *path, int depth) {
   d.close();
 }
 
-// ---------------- classes.txt labels ------------------------------------
+// ---------------- classes.txt --------------------------------------------
 static void loadClasses() {
   for (int c = 0; c < OUT_N; c++) snprintf(g_classNames[c], sizeof(g_classNames[c]), "Class %d", c);
   File f = SD.open("/vision/classes.txt", FILE_READ);
@@ -360,6 +464,10 @@ static void saveClasses() {
   }
 }
 
+static int countBmp(const char *folder);
+static int countBmpEx(int cls, bool train);
+static int nModelCount();
+
 // ---------------- dataset -------------------------------------------------
 static bool allocDataset() {
   if (g_trainData) return true;
@@ -376,7 +484,6 @@ static int loadDataset() {
     File d = SD.open(dir);
     if (!d) continue;
     File f = d.openNextFile();
-    int perClass = 0;
     while (f && g_trainCount < MAX_DATASET) {
       if (!f.isDirectory() && endsWithBmp(f.name())) {
         char full[96];
@@ -384,7 +491,6 @@ static int loadDataset() {
         if (readBmp64(full, g_trainData + (size_t)g_trainCount * INPUT_N)) {
           g_trainLabels[g_trainCount] = (uint8_t)c;
           g_trainCount++;
-          perClass++;
         }
       }
       f.close();
@@ -392,7 +498,6 @@ static int loadDataset() {
     }
     f.close();
     d.close();
-    (void)perClass;
   }
   return g_trainCount;
 }
@@ -463,11 +568,9 @@ static int bestClass(float *probs) {
   return best;
 }
 
-// SGD step: assumes forwardPass() already ran for the same sample.
 static void trainStep(int label) {
   float deltaO[OUT_N];
   for (int o = 0; o < OUT_N; o++) deltaO[o] = g_y[o] - (o == label ? 1.0f : 0.0f);
-
   for (int h = 0; h < HIDDEN_N; h++) {
     float dh = 0.0f;
     for (int o = 0; o < OUT_N; o++) dh += W2[o * HIDDEN_N + h] * deltaO[o];
@@ -515,12 +618,14 @@ static void trainModelInPlace() {
     float avgLoss = lossSum / (float)n;
     totalLoss = avgLoss;
     float acc = 100.0f * ok / (float)n;
-    uint32_t elapsedMin = (millis() - tStart) / 60000;
     uint32_t remaining = (uint32_t)(((double)eMs * (g_epochs - 1 - e)) / 1000.0);
-    Serial.printf("  epoch %d/%d  loss=%.4f  acc=%.1f%%  %ums/epoch  elapsed=%lum%lus  ETA~%lus\n",
-                  e + 1, (int)g_epochs, avgLoss, acc, (unsigned)eMs,
-                  (unsigned)(elapsedMin), (unsigned)((millis() - tStart) / 1000 % 60), (unsigned)remaining);
-    delay(10);   // let the serial monitor breathe
+    // publish state for the OLED training page
+    g_prEpoch = e + 1; g_prEpochs = (int)g_epochs;
+    g_prLoss = avgLoss; g_prAcc = acc; g_prEtaS = remaining;
+    Serial.printf("  epoch %d/%d  loss=%.4f  acc=%.1f%%  %ums/epoch  ETA~%lus\n",
+                  e + 1, (int)g_epochs, avgLoss, acc, (unsigned)eMs, (unsigned)remaining);
+    oledTouchRequest();
+    delay(10);
   }
   g_totalEpochs += g_epochs;
   g_lastLoss = (float)totalLoss;
@@ -543,14 +648,15 @@ static bool saveModel() {
 
   File f = SD.open(path, FILE_WRITE);
   if (!f) { Serial.println("  cannot create model file"); return false; }
+  setLed(false);
 
   uint8_t hdr[32] = {0};
   memcpy(hdr, "XIAOMLP1", 8);
-  putU32(hdr + 8, 1);          // format version
+  putU32(hdr + 8, 1);
   putU16(hdr + 12, INPUT_N);
   putU16(hdr + 14, HIDDEN_N);
   putU16(hdr + 16, OUT_N);
-  putU16(hdr + 18, 2);         // flags: 2 = trained
+  putU16(hdr + 18, 2);
   putU32(hdr + 20, g_totalEpochs);
   putF32(hdr + 24, g_lastLoss);
   f.write(hdr, 32);
@@ -598,6 +704,7 @@ static bool loadModel(int which) {
   snprintf(path, sizeof(path), "/vision/models/model_%04d.bin", which);
   File f = SD.open(path, FILE_READ);
   if (!f) { Serial.println("  cannot open model file"); return false; }
+  setLed(false);
   uint8_t hdr[32];
   if (f.read(hdr, 32) != 32 || memcmp(hdr, "XIAOMLP1", 8) != 0) {
     Serial.println("  bad model header");
@@ -626,7 +733,128 @@ static bool loadModel(int which) {
   return true;
 }
 
-// ---------------- menu actions ---------------------------------------------
+// =========================================================================
+//  OLED rendering
+// =========================================================================
+// Screen: 72x40. Font: 5x8 -> 14 chars x 5 rows.
+// g_curImg is the current 64x64 RGB888 frame.
+
+static void oledRenderImage(int srcY0, int rows, int dstX, int dstY) {
+  // draw dark pixels as lit (threshold ~110): outlines/scenes read clearly
+  for (int y = 0; y < rows; y++) {
+    int sy = srcY0 + y;
+    size_t row = (size_t)sy * IMG_W;
+    for (int x = 0; x < IMG_W; x++) {
+      size_t k = (row + x) * 3;
+      if (pixGray(g_curImg, k) < 110.0f) u8g2.drawPixel(dstX + x, dstY + y);
+    }
+  }
+}
+
+static void oledRenderMenu() {
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_5x8_tf);
+    for (int r = 0; r < 5; r++) {
+      int idx = g_menuTop + r;
+      if (idx >= g_menuCount) break;
+      bool act = (idx == g_menuCur);
+      if (act) {
+        u8g2.setDrawColor(1);
+        u8g2.drawBox(0, r * 8, 72, 8);
+        u8g2.setDrawColor(0);
+        u8g2.drawStr(1, r * 8 + 7, g_menuItems[idx].label);
+        u8g2.setDrawColor(1);
+      } else {
+        u8g2.drawStr(1, r * 8 + 7, g_menuItems[idx].label);
+      }
+    }
+  } while (u8g2.nextPage());
+}
+
+static void oledRenderInfo() {
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_5x8_tf);
+    for (int r = 0; r < 5; r++) {
+      if (g_infoLines[r][0]) u8g2.drawStr(1, r * 8 + 7, g_infoLines[r]);
+    }
+  } while (u8g2.nextPage());
+}
+
+static void oledRenderTrain() {
+  char a[14], b[14], c[14], d[14];
+  snprintf(a, sizeof(a), "TRAIN %d/%d", g_prEpoch, g_prEpochs);
+  snprintf(b, sizeof(b), "loss %.3f", g_prLoss);
+  snprintf(c, sizeof(c), "acc %.1f%%", g_prAcc);
+  snprintf(d, sizeof(d), "ETA ~%lus", (unsigned)g_prEtaS);
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_5x8_tf);
+    u8g2.drawStr(1, 7, a);
+    u8g2.drawStr(1, 15, b);
+    u8g2.drawStr(1, 23, c);
+    u8g2.drawStr(1, 31, d);
+    // progress bar, bottom 8px
+    int pct = (g_prEpoch <= 0) ? 0 : (int)(70L * g_prEpoch / g_prEpochs);
+    u8g2.drawFrame(0, 33, 72, 6);
+    if (pct > 1) u8g2.drawBox(1, 34, pct, 4);
+  } while (u8g2.nextPage());
+}
+
+static void oledRenderCamera() {
+  char fpline[14];
+  snprintf(fpline, sizeof(fpline), "%s %d fps", g_camInfo, g_camFps);
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_5x8_tf);
+    if (g_camShow == CSH_INFER) {
+      // 2 text rows + 24-row image view (center of frame)
+      u8g2.drawStr(1, 7, g_camInfo);
+      u8g2.drawStr(1, 15, fpline);
+      oledRenderImage(20, 24, (72 - IMG_W) / 2, 16);
+    } else if (g_camShow == CSH_CAPTURE) {
+      // shot counter row + 32-row image = 40px total
+      char shot[14];
+      snprintf(shot, sizeof(shot), "SHOT %d/%d C%d", g_capProg, g_capTotal, g_capCls);
+      u8g2.drawStr(1, 7, shot);
+      oledRenderImage(16, 32, (72 - IMG_W) / 2, 8);
+    } else {
+      // full-screen B/W preview: 64x40 center strip
+      oledRenderImage(12, 40, (72 - IMG_W) / 2, 0);
+    }
+  } while (u8g2.nextPage());
+}
+
+static void oledUpdate() {
+  if (!g_oledDirty) return;
+  switch (g_oledMode) {
+    case OLM_MENU:   oledRenderMenu(); break;
+    case OLM_TRAIN:  oledRenderTrain(); break;
+    case OLM_CAMERA: oledRenderCamera(); break;
+    case OLM_INFO:   oledRenderInfo(); break;
+  }
+  g_oledDirty = false;
+}
+
+static void oledEnterMenu() {
+  g_oledMode = OLM_MENU;
+  g_camShow = CSH_NONE;
+  oledTouchRequest();
+}
+
+static void oledSetInfo(const char *l0, const char *l1, const char *l2, const char *l3, const char *l4) {
+  memset(g_infoLines, 0, sizeof(g_infoLines));
+  const char *ls[5] = { l0, l1, l2, l3, l4 };
+  for (int i = 0; i < 5; i++)
+    if (ls[i]) { strncpy(g_infoLines[i], ls[i], 13); g_infoLines[i][13] = 0; }
+  g_oledMode = OLM_INFO;
+  oledTouchRequest();
+}
+
+// =========================================================================
+//  Serial + input helpers
+// =========================================================================
 static String readLine(uint32_t timeoutMs) {
   String s = "";
   uint32_t t0 = millis();
@@ -636,6 +864,7 @@ static String readLine(uint32_t timeoutMs) {
       if (c == '\n') return s;
       if (c != '\r') s += c;
     }
+    if (pollTouchKeys()) return s;      // any touch aborts a long serial prompt
     delay(2);
   }
   return s;
@@ -644,7 +873,7 @@ static String readLine(uint32_t timeoutMs) {
 static long promptInt(const char *prompt, long lo, long hi) {
   while (true) {
     Serial.print(prompt);
-    String s = readLine(20000);
+    String s = readLine(10000);
     long v = s.toInt();
     if (s.length() > 0 && v >= lo && v <= hi) return v;
     Serial.printf("  please enter %d..%d\n", lo, hi);
@@ -653,56 +882,179 @@ static long promptInt(const char *prompt, long lo, long hi) {
 
 static bool confirmAction(const char *what) {
   Serial.printf("  type YES to %s: ", what);
-  String s = readLine(20000);
+  String s = readLine(10000);
   s.toUpperCase();
   s.trim();
   return s == "YES";
 }
 
-static void captureToClass(int cls, bool testSet, int count) {
+// =========================================================================
+//  ML / capture action flows (shared by OLED touch menu + serial menu)
+// =========================================================================
+static bool enteredFromTouch = false;
+
+static void captureRGB888Auto(int cls, bool testSet, int count) {
   if (!g_sdOk) { Serial.println("  no SD card"); return; }
   if (!g_camOk) { Serial.println("  camera unavailable"); return; }
   char dir[64];
   if (testSet) testDirPath(dir, sizeof(dir), cls); else trainDirPath(dir, sizeof(dir), cls);
+  g_oledMode = OLM_CAMERA;
+  g_camShow = CSH_CAPTURE;
+  g_capCls = cls; g_capTotal = count;
   for (int k = 0; k < count; k++) {
+    if (!captureRGB888()) { Serial.println("  capture failed"); break; }
     int idx = nextImgIndex(dir);
-    if (idx < 0) { Serial.println("  folder full"); return; }
+    if (idx < 0) { Serial.println("  folder full"); break; }
     char path[96];
     snprintf(path, sizeof(path), "%s/img_%04d.bmp", dir, idx);
-    if (!captureRGB888(g_curImg)) { Serial.println("  capture failed"); return; }
-    if (!writeBmp64(path, g_curImg)) { Serial.println("  SD write failed"); return; }
+    if (!writeBmp64(path, g_curImg)) { Serial.println("  SD write failed"); break; }
+    g_capProg = k + 1;
+    oledTouchRequest();
     Serial.printf("  saved %s\n", path);
-    if (k < count - 1) delay(600);
+    if (count > 1 && k < count - 1) {
+      // 3s gap between shots so the user can change the object pose
+      uint32_t t0 = millis();
+      while (millis() - t0 < 3000) {
+        uint8_t m = pollTouchKeys();
+        if (keyPressed(m, 3)) {          // D3 = skip remaining shots
+          Serial.println("  sequence aborted by D3");
+          oledEnterMenu();
+          return;
+        }
+        oledUpdate();
+        delay(2);
+      }
+    }
   }
-  Serial.printf("  --- %s (%s) ---\n", testSet ? "test" : "train", g_classNames[cls]);
+  Serial.printf("  --- %s class %d [%s]: %d shots ---\n",
+                testSet ? "test" : "train", cls, g_classNames[cls], g_capProg);
   previewASCII(g_curImg);
+  oledEnterMenu();
 }
 
-static void liveInference() {
-  if (!nnReady()) { Serial.println("  MLP weights unavailable (PSRAM missing?)"); return; }
-  if (!g_camOk) { Serial.println("  camera unavailable"); return; }
-  if (!g_weightInit) { Serial.println("  no model - train (5) or load (9) first"); return; }
-  if (!captureRGB888(g_curImg)) { Serial.println("  capture failed"); return; }
-  previewASCII(g_curImg);
-  normImage(g_curImg, g_xnorm);
-  float probs[OUT_N];
-  int best = bestClass(probs);
-  Serial.printf("  -> class %d [%s]: %.2f%%\n", best, g_classNames[best], 100.0f * probs[best]);
-  // runner-ups
-  int order[OUT_N];
-  for (int i = 0; i < OUT_N; i++) order[i] = i;
-  for (int i = 0; i < OUT_N - 1; i++)
-    for (int j = i + 1; j < OUT_N; j++)
-      if (probs[order[j]] > probs[order[i]]) { int t = order[i]; order[i] = order[j]; order[j] = t; }
-  Serial.print("  top-3: ");
-  for (int i = 0; i < OUT_N; i++)
-    Serial.printf("%s=%.0f%%  ", g_classNames[order[i]], 100.0f * probs[order[i]]);
-  Serial.println();
+static void streamCamera(bool withInference) {
+  if (!g_camOk) { Serial.println("  camera unavailable"); oledEnterMenu(); return; }
+  if (withInference && !nnReady()) { Serial.println("  MLP weights unavailable (PSRAM?)"); oledEnterMenu(); return; }
+  if (withInference && !g_weightInit) { Serial.println("  no model - train (5) or load (9) first"); oledEnterMenu(); return; }
+
+  g_oledMode = OLM_CAMERA;
+  g_camShow = withInference ? CSH_INFER : CSH_PREVIEW;
+  uint32_t frameCount = 0;
+  uint32_t fpsWindow = millis();
+  uint32_t lastSerial = 0;
+  g_oledDirty = true;
+
+  while (true) {
+    if (!captureRGB888()) { delay(5); continue; }
+    frameCount++;
+
+    if (withInference) {
+      normImage(g_curImg, g_xnorm);
+      float probs[OUT_N];
+      int best = bestClass(probs);
+      float fps = 0.0f;
+      if (millis() - fpsWindow >= 1000) {
+        fps = 1000.0f * frameCount / (float)(millis() - fpsWindow);
+        fpsWindow = millis();
+        frameCount = 0;
+      }
+      if (millis() - lastSerial >= 500) {
+        lastSerial = millis();
+        Serial.printf("  [live] %s %.1f%%   fps=%.1f  (D3 to exit)\n",
+                      g_classNames[best], 100.0f * probs[best], fps);
+      }
+      // throttle OLED: draw every 10th inference frame
+      if (frameCount % 10 == 1) {
+        snprintf(g_camInfo, sizeof(g_camInfo), "%s %.0f%%",
+                 g_classNames[best], 100.0f * probs[best]);
+        g_camInfo[12] = 0;                       // force 13-char max
+        g_camFps = (int)fps;
+        g_oledDirty = true;
+        oledUpdate();
+      }
+    } else {
+      if (millis() - fpsWindow >= 200) {   // ~5 fps preview refresh
+        fpsWindow = millis();
+        g_oledDirty = true;
+        oledUpdate();
+      }
+    }
+
+    uint8_t m = pollTouchKeys();
+    if (keyPressed(m, 3)) {                 // D3 = exit streaming
+      Serial.println("  stream stopped");
+      break;
+    }
+    delay(1);
+  }
+  oledEnterMenu();
+}
+
+static void streamPreview()  { streamCamera(false); }
+static void streamInference(){ streamCamera(true); }
+
+static void trainFlow() {
+  if (!nnReady()) { Serial.println("  MLP weights unavailable (PSRAM missing?)"); oledEnterMenu(); return; }
+  if (!g_sdOk) { Serial.println("  no SD card - cannot read dataset"); oledEnterMenu(); return; }
+  if (!g_weightInit) {
+    Serial.println("  fresh random weights (Glorot init)");
+    nnInitWeights();
+  }
+  if (!allocDataset()) { Serial.println("  not enough PSRAM for dataset"); oledEnterMenu(); return; }
+  int n = loadDataset();
+  if (n == 0) {
+    Serial.println("  no training images - capture some first (menu 1)");
+    oledEnterMenu();
+    return;
+  }
+  int perCl[OUT_N] = {0};
+  for (int i = 0; i < n; i++) perCl[g_trainLabels[i]]++;
+  Serial.printf("  dataset: %d images  (", n);
+  for (int c = 0; c < OUT_N; c++) Serial.printf("%s:%d ", g_classNames[c], perCl[c]);
+  Serial.printf(")\n  epochs=%d lr=%.3f  (change via serial menu B)\n", (int)g_epochs, g_lr);
+  Serial.println("  training...");
+
+  g_prActive = true;
+  g_oledMode = OLM_TRAIN;
+  g_oledDirty = true;
+  uint32_t t0 = millis();
+  trainModelInPlace();
+  uint32_t secs = (millis() - t0) / 1000;
+  g_prActive = false;
+  Serial.printf("  --- training done in %lus, final loss=%.4f, total epochs=%u ---\n",
+                (unsigned)secs, g_lastLoss, (unsigned)g_totalEpochs);
+
+  char l[5][14];
+  snprintf(l[0], 14, "DONE in %lus", (unsigned)secs);
+  snprintf(l[1], 14, "loss %.4f", g_lastLoss);
+  snprintf(l[2], 14, "epochs %u", (unsigned)g_totalEpochs);
+  snprintf(l[3], 14, "D0 save / D3 end");
+  snprintf(l[4], 14, "");
+  oledSetInfo(l[0], l[1], l[2], l[3], l[4]);
+  g_oledDirty = true;
+
+  // give the user a moment on OLED: D0 = save now, D3 = skip
+  uint32_t t1 = millis();
+  while (millis() - t1 < 20000) {
+    uint8_t m = pollTouchKeys();
+    if (keyPressed(m, 0)) { saveModel(); oledEnterMenu(); break; }
+    if (keyPressed(m, 3)) { Serial.println("  skip save"); oledEnterMenu(); break; }
+    oledUpdate();
+    delay(2);
+  }
+  if (g_oledMode == OLM_INFO) {
+    if (enteredFromTouch) {
+      oledEnterMenu();                       // timeout on OLED path: back to menu
+    } else {
+      if (confirmAction("save the model to SD now")) saveModel();
+      oledEnterMenu();
+    }
+  }
 }
 
 static void evalTestSet() {
-  if (!nnReady()) { Serial.println("  MLP weights unavailable (PSRAM missing?)"); return; }
-  if (!g_weightInit) { Serial.println("  no model - train (5) or load (9) first"); return; }
+  if (!nnReady()) { Serial.println("  MLP weights unavailable (PSRAM missing?)"); oledEnterMenu(); return; }
+  if (!g_weightInit) { Serial.println("  no model - train (5) or load (9) first"); oledEnterMenu(); return; }
   int cm[OUT_N][OUT_N] = {{0}};
   int perClassTotal[OUT_N] = {0};
   int ok = 0, total = 0;
@@ -730,7 +1082,7 @@ static void evalTestSet() {
     }
     d.close();
   }
-  if (total == 0) { Serial.println("  no test images under /vision/test"); return; }
+  if (total == 0) { Serial.println("  no test images under /vision/test"); oledEnterMenu(); return; }
   Serial.println("  confusion matrix (rows=true class, cols=predicted):");
   for (int c = 0; c < OUT_N; c++) {
     Serial.printf("  %s: ", g_classNames[c]);
@@ -738,41 +1090,39 @@ static void evalTestSet() {
     Serial.printf("(n=%d)\n", perClassTotal[c]);
   }
   Serial.printf("  overall accuracy: %.1f%% (%d/%d)\n", 100.0f * ok / total, ok, total);
+  char l[5][14];
+  snprintf(l[0], 14, "ACC %.1f%%", 100.0f * ok / total);
+  snprintf(l[1], 14, "%d/%d right", ok, total);
+  snprintf(l[2], 14, "");
+  snprintf(l[3], 14, "");
+  snprintf(l[4], 14, "D3 to continue");
+  oledSetInfo(l[0], l[1], l[2], l[3], l[4]);
+  uint32_t t1 = millis();
+  while (millis() - t1 < 10000) {
+    uint8_t m = pollTouchKeys();
+    if (keyPressed(m, 3)) break;
+    oledUpdate();
+    delay(2);
+  }
+  oledEnterMenu();
 }
 
-static bool nnReady() { return W1 && b1 && W2 && b2; }
-
-static void printMenu() {
-  Serial.println();
-  Serial.println("================ XIAO ESP32-S3 Sense - On-device Vision ================");
-  Serial.println(" 1  capture -> TRAIN (pick class 0-2, then count)");
-  Serial.println(" 2  capture -> TEST  (pick class 0-2)");
-  Serial.println(" 3  camera ASCII preview");
-  Serial.println(" 4  dataset summary");
-  Serial.println(" 5  TRAIN model on device");
-  Serial.println(" 6  live inference (camera)");
-  Serial.println(" 7  evaluate on test set");
-  Serial.println(" 8  save model to SD  (/vision/models/model_XXXX.bin)");
-  Serial.println(" 9  load model from SD");
-  Serial.println(" A  list files on SD (/vision tree)");
-  Serial.println(" B  hyperparameters (epochs / learning rate)");
-  Serial.println(" C  class names");
-  Serial.println(" D  delete data (train / test / models)");
-  Serial.println(" 0  print this menu");
-  Serial.println("========================================================================");
-  Serial.print("> ");
-}
-
-static void captureTrainFlow() {
-  int cls = (int)promptInt("  which class (0..2): ", 0, OUT_N - 1);
-  int cnt = (int)promptInt("  how many images (1..20): ", 1, 20);
-  Serial.printf("  show class %d [%s] to the camera...\n", cls, g_classNames[cls]);
-  captureToClass(cls, false, cnt);
-}
-
-static void captureTestFlow() {
-  int cls = (int)promptInt("  which class (0..2): ", 0, OUT_N - 1);
-  captureToClass(cls, true, 1);
+static void loadNewestModel() {
+  if (!g_sdOk) { Serial.println("  no SD card"); oledEnterMenu(); return; }
+  int idx = 1, found = 0;
+  while (idx < 10000) {
+    char p[96];
+    snprintf(p, sizeof(p), "/vision/models/model_%04d.bin", idx);
+    if (SD.exists(p)) found = idx;
+    idx++;
+  }
+  if (found == 0) {
+    Serial.println("  no models on SD - train & save first");
+    oledEnterMenu();
+    return;
+  }
+  loadModel(found);
+  oledEnterMenu();
 }
 
 static void datasetSummary() {
@@ -793,30 +1143,172 @@ static void datasetSummary() {
     Serial.printf("  ram model: initialized (%u epochs trained, last loss=%.4f)\n", (unsigned)g_totalEpochs, g_lastLoss);
   else
     Serial.println("  ram model: NOT initialized");
+  char l[5][14];
+  snprintf(l[0], sizeof(l[0]), "T0 %d", countBmpEx(0, true));
+  snprintf(l[1], sizeof(l[1]), "T1 %d", countBmpEx(1, true));
+  snprintf(l[2], sizeof(l[2]), "T2 %d", countBmpEx(2, true));
+  snprintf(l[3], sizeof(l[3]), "test sum %d", countBmpEx(0, false) + countBmpEx(1, false) + countBmpEx(2, false));
+  snprintf(l[4], sizeof(l[4]), "D3 to continue");
+  oledSetInfo(l[0], l[1], l[2], l[3], l[4]);
+  uint32_t t1 = millis();
+  while (millis() - t1 < 10000) {
+    uint8_t m = pollTouchKeys();
+    if (keyPressed(m, 3)) break;
+    oledUpdate();
+    delay(2);
+  }
+  oledEnterMenu();
 }
 
-static void trainFlow() {
-  if (!nnReady()) { Serial.println("  MLP weights unavailable (PSRAM missing?)"); return; }
-  if (!g_sdOk) { Serial.println("  no SD card - cannot read dataset"); return; }
-  if (!g_weightInit) {
-    Serial.println("  fresh random weights (Glorot init)");
-    nnInitWeights();
+// =========================================================================
+//  OLED menu definition
+// =========================================================================
+static void actCap0() { captureRGB888Auto(0, false, 10); }
+static void actCap1() { captureRGB888Auto(1, false, 10); }
+static void actCap2() { captureRGB888Auto(2, false, 10); }
+static void actPreview() { streamPreview(); }
+static void actTrain() { trainFlow(); }
+static void actInfer() { streamInference(); }
+static void actEval() { evalTestSet(); }
+static void actSave() { saveModel(); oledEnterMenu(); }
+static void actLoad() { loadNewestModel(); }
+static void actInfo() {
+  char l[5][14];
+  snprintf(l[0], 14, "T0 %d/%d/%d", countBmpEx(0, true), countBmpEx(1, true), countBmpEx(2, true));
+  snprintf(l[1], 14, "T1 %d/%d/%d", countBmpEx(0, false), countBmpEx(1, false), countBmpEx(2, false));
+  snprintf(l[2], sizeof(l[2]), "%s", nModelCount() ? "MDL yes" : "MDL none");
+  snprintf(l[3], 14, "RAM %s", (nnReady() && g_weightInit) ? "trained" : "none");
+  snprintf(l[4], 14, "D3 to continue");
+  oledSetInfo(l[0], l[1], l[2], l[3], l[4]);
+  uint32_t t1 = millis();
+  while (millis() - t1 < 10000) {
+    uint8_t m = pollTouchKeys();
+    if (keyPressed(m, 3)) break;
+    oledUpdate();
+    delay(2);
   }
-  if (!allocDataset()) { Serial.println("  not enough PSRAM for dataset"); return; }
-  int n = loadDataset();
-  if (n == 0) { Serial.println("  no training images - capture some first (menu 1)"); return; }
-  int perCl[OUT_N] = {0};
-  for (int i = 0; i < n; i++) perCl[g_trainLabels[i]]++;
-  Serial.printf("  dataset: %d images  (", n);
-  for (int c = 0; c < OUT_N; c++) Serial.printf("%s:%d ", g_classNames[c], perCl[c]);
-  Serial.printf(")\n  epochs=%d lr=%.3f  (change via menu B)\n", (int)g_epochs, g_lr);
-  Serial.println("  training...");
-  uint32_t t0 = millis();
-  trainModelInPlace();
-  uint32_t secs = (millis() - t0) / 1000;
-  Serial.printf("  --- training done in %lus, final loss=%.4f, total epochs=%u ---\n",
-                (unsigned)secs, g_lastLoss, (unsigned)g_totalEpochs);
-  if (confirmAction("save the model to SD now")) saveModel();
+  oledEnterMenu();
+}
+static void actAbout() {
+  char l[5][14];
+  snprintf(l[0], 14, "mx+b 64x64x3");
+  snprintf(l[1], 14, "act D0 up D1");
+  snprintf(l[2], 14, "dn D2 bak D3");
+  snprintf(l[3], 14, "OLED 72x40");
+  snprintf(l[4], 14, "D3 to continue");
+  oledSetInfo(l[0], l[1], l[2], l[3], l[4]);
+  uint32_t t1 = millis();
+  while (millis() - t1 < 8000) {
+    uint8_t m = pollTouchKeys();
+    if (keyPressed(m, 3)) break;
+    oledUpdate();
+    delay(2);
+  }
+  oledEnterMenu();
+}
+
+// simplified info needed by actInfo above
+static int countBmpEx(int cls, bool train) {
+  char dir[64];
+  if (train) trainDirPath(dir, sizeof(dir), cls); else testDirPath(dir, sizeof(dir), cls);
+  return countBmp(dir);
+}
+static int nModelCount() {
+  int idx = 1, n = 0;
+  char p[96];
+  while (idx < 10000) {
+    snprintf(p, sizeof(p), "/vision/models/model_%04d.bin", idx);
+    if (SD.exists(p)) n++;
+    idx++;
+  }
+  return n;
+}
+
+static const MenuItem g_oledMenu[] = {
+  { "CAP0 x10", actCap0 },
+  { "CAP1 x10", actCap1 },
+  { "CAP2 x10", actCap2 },
+  { "PREVIEW",  actPreview },
+  { "TRAIN",    actTrain },
+  { "INFER LIVE", actInfer },
+  { "TEST EVAL",  actEval },
+  { "SAVE MODEL", actSave },
+  { "LOAD NEW",   actLoad },
+  { "DATA INFO",  actInfo },
+  { "ABOUT",      actAbout },
+};
+
+static void oledSetupMenu() {
+  g_menuItems = g_oledMenu;
+  g_menuCount = (int)(sizeof(g_oledMenu) / sizeof(g_oledMenu[0]));
+  g_menuCur = 0;
+  g_menuTop = 0;
+  oledEnterMenu();
+  oledUpdate();
+}
+
+// touch-driven menu navigation
+static void oledMenuNavigate(uint8_t keys) {
+  if (g_oledMode != OLM_MENU) {
+    // RUNNING an item: only D3 (back) handled inside the loops; nothing here
+    return;
+  }
+  if (keyPressed(keys, 1) && g_menuCur > 0) {           // D1 = up
+    g_menuCur--;
+    if (g_menuCur < g_menuTop) g_menuTop = g_menuCur;
+    oledTouchRequest();
+  } else if (keyPressed(keys, 2) && g_menuCur < g_menuCount - 1) {  // D2 = down
+    g_menuCur++;
+    if (g_menuCur >= g_menuTop + 5) g_menuTop = g_menuCur - 4;
+    oledTouchRequest();
+  } else if (keyPressed(keys, 0)) {                     // D0 = activate / enter
+    Serial.printf("  [OLED-menu] %s\n", g_menuItems[g_menuCur].label);
+    enteredFromTouch = true;
+    oledUpdate();
+    g_menuItems[g_menuCur].action();
+    enteredFromTouch = false;
+    oledEnterMenu();
+  } else if (keyPressed(keys, 3)) {                     // D3 = back (idle = nothing)
+    // nothing to back out of at top level
+  }
+}
+
+// =========================================================================
+//  Serial menu
+// =========================================================================
+static void printMenu() {
+  Serial.println();
+  Serial.println("===== XIAO ESP32-S3 Sense - On-device Vision v2.0 =====");
+  Serial.println(" touch: D0=enter  D1=up  D2=down  D3=back  |  OLED menu mirrors this");
+  Serial.println(" 1  capture 10 TRAIN imgs (pick class 0-2)");
+  Serial.println(" 2  capture 1 TEST img (pick class 0-2)");
+  Serial.println(" 3  camera ASCII preview");
+  Serial.println(" 4  dataset summary");
+  Serial.println(" 5  TRAIN model on device");
+  Serial.println(" 6  live inference (camera, D3 to stop)");
+  Serial.println(" 7  evaluate on test set");
+  Serial.println(" 8  save model to SD  (/vision/models/model_XXXX.bin)");
+  Serial.println(" 9  load model from SD");
+  Serial.println(" A  list files on SD (/vision tree)");
+  Serial.println(" B  hyperparameters (epochs / learning rate)");
+  Serial.println(" C  class names");
+  Serial.println(" D  delete data (train / test / models)");
+  Serial.println(" E  touch raw value demo");
+  Serial.println(" 0  print this menu");
+  Serial.println("========================================================");
+  Serial.print("> ");
+}
+
+static void captureTrainFlow() {
+  int cls = (int)promptInt("  which class (0..2): ", 0, OUT_N - 1);
+  int cnt = (int)promptInt("  how many images (1..20): ", 1, 20);
+  Serial.printf("  show class %d [%s] to the camera...\n", cls, g_classNames[cls]);
+  captureRGB888Auto(cls, false, cnt);
+}
+
+static void captureTestFlow() {
+  int cls = (int)promptInt("  which class (0..2): ", 0, OUT_N - 1);
+  captureRGB888Auto(cls, true, 1);
 }
 
 static void hyperparamFlow() {
@@ -828,7 +1320,7 @@ static void hyperparamFlow() {
   } else if (ch == 2) {
     for (int attempt = 0; attempt < 10; attempt++) {
       Serial.print("    learning rate (0.001..1.0): ");
-      String s = readLine(20000);
+      String s = readLine(10000);
       if (s.length() > 0) {
         float v = s.toFloat();
         if (v >= 0.001f && v <= 1.0f) { g_lr = v; break; }
@@ -844,7 +1336,7 @@ static void classNamesFlow() {
   for (int c = 0; c < OUT_N; c++) Serial.printf("  [%d] %s\n", c, g_classNames[c]);
   int c = (int)promptInt("  edit which class (0..2): ", 0, OUT_N - 1);
   Serial.printf("  new name for class %d (max 23 chars): ", c);
-  String s = readLine(20000);
+  String s = readLine(10000);
   s.trim();
   if (s.length() > 0 && s.length() <= 23) {
     memset(g_classNames[c], 0, sizeof(g_classNames[c]));
@@ -873,21 +1365,32 @@ static void deleteFlow() {
   Serial.println("  folders re-created");
 }
 
+static void touchDemo() {
+  Serial.println("  touch raw values for 10s (touch pads with finger):");
+  uint32_t t0 = millis();
+  while (millis() - t0 < 10000) {
+    Serial.printf("  D0=%d D1=%d D2=%d D3=%d\n",
+                  touchRead(TOUCH_ENTER), touchRead(TOUCH_UP),
+                  touchRead(TOUCH_DOWN), touchRead(TOUCH_BACK));
+    delay(400);
+  }
+}
+
 static void dispatchMenu(String line) {
   line.trim();
   if (line.length() == 0) return;
   char c = line[0];
-  if (c >= 'A' && c <= 'Z') c = (char)(c + 32);   // manual lowercase, no ctype.h
+  if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
   switch (c) {
     case '1': captureTrainFlow(); break;
     case '2': captureTestFlow(); break;
     case '3':
-      if (g_camOk && captureRGB888(g_curImg)) previewASCII(g_curImg);
+      if (g_camOk && captureRGB888()) previewASCII(g_curImg);
       else Serial.println("  camera unavailable");
       break;
     case '4': datasetSummary(); break;
     case '5': trainFlow(); break;
-    case '6': liveInference(); break;
+    case '6': streamInference(); break;
     case '7': evalTestSet(); break;
     case '8': saveModel(); break;
     case '9': {
@@ -902,6 +1405,7 @@ static void dispatchMenu(String line) {
     case 'b': hyperparamFlow(); break;
     case 'c': classNamesFlow(); break;
     case 'd': deleteFlow(); break;
+    case 'e': touchDemo(); break;
     case '0': printMenu(); break;
     default: Serial.printf("  unknown command '%c' - menu 0\n", c);
   }
@@ -909,33 +1413,35 @@ static void dispatchMenu(String line) {
   Serial.print("> ");
 }
 
-// ---------------- setup / loop ----------------------------------------------
+// =========================================================================
+//  setup / loop
+// =========================================================================
 void setup() {
-  pinMode(LED_BUILTIN_NEG, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
   setLed(true);
   Serial.begin(115200);
   Serial.setTxTimeoutMs(0);
   uint32_t t0 = millis();
-  while (!Serial && millis() - t0 < 3000) delay(10);   // don't deadlock on USB CDC
+  while (!Serial && millis() - t0 < 3000) delay(10);
 
   g_psramOk = psramFound();
 
   Serial.println();
-  Serial.println("XIAO ESP32-S3 Sense - On-Device Vision Trainer v1.0");
-  Serial.println("build: esp32:esp32:XIAO_ESP32S3:PSRAM=opi  (PSRAM required)");
+  Serial.println("XIAO ESP32-S3 Sense - On-Device Vision Trainer v2.0");
+  Serial.println("build: esp32:esp32:XIAO_ESP32S3:PSRAM=opi (PSRAM required)");
   Serial.printf("PSRAM: %s\n", g_psramOk ? "OK" : "MISSING - camera/model will fail");
 
-  if (g_psramOk && !nnAlloc()) {
-    Serial.println("FATAL: could not allocate MLP weights in PSRAM");
-  }
-  if (!allocDataset()) {
-    Serial.println("warning: dataset buffer unavailable");
-  }
+  if (g_psramOk && !nnAlloc()) Serial.println("FATAL: could not allocate MLP weights in PSRAM");
+  if (!allocDataset()) Serial.println("warning: dataset buffer unavailable");
 
   g_camOk = initCamera();
   Serial.printf("camera: %s\n", g_camOk ? "OK" : "FAILED");
 
-  SPI.begin(7, 8, 9, SD_CS_PIN);   // Sense SD slots: SCK=GPIO7, MISO=GPIO8, MOSI=GPIO9
+  // OLED on Wire (SDA=GPIO5/D4, SCL=GPIO6/D5)
+  u8g2.begin();
+  u8g2.setFont(u8g2_font_5x8_tf);
+  Serial.printf("OLED: 72x40 SSD1306 %s\n", u8g2.getBufferPtr() ? "OK" : "FAILED");
+
   if (SD.begin(SD_CS_PIN)) {
     g_sdOk = true;
     Serial.printf("SD: OK - card type %d, size %llu MB\n",
@@ -945,22 +1451,27 @@ void setup() {
   } else {
     Serial.println("SD: FAILED - insert FAT32 microSD and reset");
   }
+  (void)SPI; // SPI not used directly; SD() binds internally
 
+  touchCalibrate();
+  oledSetupMenu();
   setLed(false);
   printMenu();
 }
 
 void loop() {
-  static uint32_t lastBlink = 0;
-  static bool ledState = false;
-  if (millis() - lastBlink >= 1000) {
-    lastBlink = millis();
-    ledState = !ledState;
-    setLed(ledState);
-  }
+  uint8_t keys = pollTouchKeys();
+  if (keys) oledMenuNavigate(keys);
+
+  oledUpdate();
+
   if (Serial.available()) {
     String line = readLine(10000);
-    dispatchMenu(line);
+    if (line.length() > 0) {
+      oledEnterMenu();          // any serial command bounces OLED back to menu
+      dispatchMenu(line);
+    }
   }
+  delay(2);
 }
-// deerflow_build_id=20260909T045352Z-d441fb747625-1cd53b6ad0ba
+// deerflow_build_id=20260910T041811Z-9ce6a778f8ab-01584f311f99
